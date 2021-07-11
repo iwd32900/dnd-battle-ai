@@ -259,11 +259,18 @@ class Environment:
             actor.end_of_encounter(self)
         return (0 in active_teams)
 
-def run_epochs(rank, pipe, hero_strat, goblin_strat):
+def init_workers(strats):
     #print(rnd.random()) # confirm that each process has unique random seed
-    hero_strat.alloc_buf()
-    goblin_strat.alloc_buf()
-    hero = lambda: PPOCharacter(hero_strat, name='Hero', team=0, hp=20, ac=15, actions=[
+    global strategies
+    strategies = strats
+    for s in strategies:
+        s.alloc_buf()
+
+def run_epoch(n):
+    global strategies
+    for s in strategies:
+        s.buf.reset()
+    hero = lambda: PPOCharacter(strategies[0], name='Hero', team=0, hp=20, ac=15, actions=[
             Dodge(),
             MeleeAttack('long sword', +3, '1d8+1', 'slashing'),
             #MeleeAttack('greataxe', +3, '1d12+1', 'slashing'),
@@ -271,22 +278,20 @@ def run_epochs(rank, pipe, hero_strat, goblin_strat):
             HealingPotion('potion of greater healing', '4d4+4', uses=3),
         ])
     #goblin = lambda i: RandomCharacter(f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
-    goblin = lambda i: PPOCharacter(goblin_strat, survival=0, name=f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
+    goblin = lambda i: PPOCharacter(strategies[1], survival=0, name=f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
             Dodge(),
             MeleeAttack('scimitar', +4, '1d6+2', 'slashing')
         ])
-    while True:
-        job = pipe.recv()
-        if job is None: break
-        n = job
-        wins = 0
-        for i in range(n):
-            env = Environment([hero(), goblin(1), goblin(2)])
-            win = env.run()
-            if win: wins += 1
-        pipe.send((wins, hero_strat.buf, goblin_strat.buf))
-        hero_strat.buf.reset()
-        goblin_strat.buf.reset()
+    wins = 0
+    for i in range(n):
+        env = Environment([hero(), goblin(1), goblin(2)])
+        if env.run(): wins += 1
+    return [s.buf for s in strategies] + [wins]
+
+def run_update(args):
+    ppo_buffers, strategy = args
+    data = merge_ppo_data(ppo_buffers)
+    strategy.update(data)
 
 def merge_ppo_data(ppo_buffers):
     data = [x.get() for x in ppo_buffers]
@@ -298,37 +303,18 @@ def merge_ppo_data(ppo_buffers):
 def main():
     epochs = 20
     ncpu = 4 # using 8 doesn't seem to help on an M1
-    hero_strat = PPOStrategy(3)
-    goblin_strat = PPOStrategy(2)
-    pipes = []
-    processes = []
-    for i in range(ncpu):
-        p1, p2 = multiprocessing.Pipe()
-        proc = multiprocessing.Process(target=run_epochs, kwargs=dict(
-            rank = i,
-            pipe = p2,
-            hero_strat = hero_strat,
-            goblin_strat = goblin_strat,
-        ))
-        proc.start()
-        processes.append(proc)
-        pipes.append(p1)
-    for epoch in range(epochs):
-        t1 = time.time()
-        _ = [p.send(1000//ncpu) for p in pipes]
-        results = [p.recv() for p in pipes]
-        t2 = time.time()
-        wins = np.array([x[0] for x in results]) * ncpu
-        hero_data = merge_ppo_data([x[1] for x in results])
-        hero_strat.update(hero_data)
-        goblin_data = merge_ppo_data([x[2] for x in results])
-        goblin_strat.update(goblin_data)
-        t3 = time.time()
-        print(f"{wins.mean():.0f} ± {wins.std():.0f} wins in {t2-t1:.1f} + {t3-t2:.1f} sec with {len(hero_data['obs'])} + {len(goblin_data['obs'])} obs")
-    for p in pipes:
-        p.send(None)
-    for p in processes:
-        p.join()
+    strategies = [PPOStrategy(3), PPOStrategy(2)]
+    with multiprocessing.Pool(ncpu, init_workers, (strategies,)) as pool:
+        for epoch in range(epochs):
+            t1 = time.time()
+            results = pool.map(run_epoch, [1000//ncpu for _ in range(ncpu)])
+            # transpose results matrix so entries of same type are together
+            results = list(zip(*results))
+            t2 = time.time()
+            wins = np.array(results[-1]) * ncpu
+            pool.map(run_update, [(results[i], s) for i, s in enumerate(strategies)])
+            t3 = time.time()
+            print(f"Epoch {epoch:04d}:  {wins.mean():.0f} ± {wins.std():.0f} wins in {t2-t1:.1f} + {t3-t2:.1f} sec")
 
 if __name__ == '__main__':
     main()
