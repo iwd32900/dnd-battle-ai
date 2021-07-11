@@ -454,7 +454,7 @@ class PPOAlgo:
             kl = pi_info['kl'] # mpi_avg() is the average over processors
             if kl > 1.5 * self.target_kl:
                 # logger.log('Early stopping at step %d due to reaching max kl.'%i)
-                print('Early stopping at step %d due to reaching max kl.'%i)
+                #print('Early stopping at step %d due to reaching max kl.'%i)
                 break
             loss_pi.backward()
             # mpi_avg_grads(ac.pi)    # average grads across MPI processes

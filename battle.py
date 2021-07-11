@@ -3,8 +3,10 @@
 from __future__ import annotations # allows forward declaration of types
 import itertools
 import re
+import time
 import numpy as np
 import torch
+from torch import multiprocessing
 import ppo_clip
 rnd = np.random.default_rng()
 
@@ -80,9 +82,13 @@ class PPOStrategy:
         self.n_acts = n_acts * MAX_CHARS
         self.obs_dim = 5 * MAX_CHARS
         self.act_crit = ppo_clip.MLPActorCritic(self.obs_dim, self.n_acts, hidden_sizes=[32])
-        self.buf = ppo_clip.PPOBuffer(self.obs_dim, self.n_acts, act_dim=None, size=1000 * 5 * MAX_TURNS)
+        self.act_crit.share_memory() # docs say this is required, but doesn't seem to be?
         self.optim = ppo_clip.PPOAlgo(self.act_crit) #, pi_lr=1e-4)
         self.encounters = 0
+
+    def alloc_buf(self):
+        # Wait to allocate the buffers until we're in worker processes, so we don't trample the same memory
+        self.buf = ppo_clip.PPOBuffer(self.obs_dim, self.n_acts, act_dim=None, size=1000 * 5 * MAX_TURNS)
 
     def end_of_encounter(self):
         self.encounters += 1
@@ -253,8 +259,10 @@ class Environment:
             actor.end_of_encounter(self)
         return (0 in active_teams)
 
-def run_epoch(args):
-    n, hero_strat, goblin_strat = args
+def run_epochs(rank, pipe, hero_strat, goblin_strat):
+    #print(rnd.random()) # confirm that each process has unique random seed
+    hero_strat.alloc_buf()
+    goblin_strat.alloc_buf()
     hero = lambda: PPOCharacter(hero_strat, name='Hero', team=0, hp=20, ac=15, actions=[
             Dodge(),
             MeleeAttack('long sword', +3, '1d8+1', 'slashing'),
@@ -262,17 +270,23 @@ def run_epoch(args):
             #HealingPotion('potion of healing', '2d4+2', uses=3),
             HealingPotion('potion of greater healing', '4d4+4', uses=3),
         ])
-    goblin = lambda i: RandomCharacter(f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
-    #goblin = lambda i: PPOCharacter(goblin_strat, survival=0, name=f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
+    #goblin = lambda i: RandomCharacter(f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
+    goblin = lambda i: PPOCharacter(goblin_strat, survival=0, name=f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
             Dodge(),
             MeleeAttack('scimitar', +4, '1d6+2', 'slashing')
         ])
-    wins = 0
-    for i in range(n):
-        env = Environment([hero(), goblin(1), goblin(2)])
-        win = env.run()
-        if win: wins += 1
-    return (wins, hero_strat.buf, goblin_strat.buf)
+    while True:
+        job = pipe.recv()
+        if job is None: break
+        n = job
+        wins = 0
+        for i in range(n):
+            env = Environment([hero(), goblin(1), goblin(2)])
+            win = env.run()
+            if win: wins += 1
+        pipe.send((wins, hero_strat.buf, goblin_strat.buf))
+        hero_strat.buf.reset()
+        goblin_strat.buf.reset()
 
 def merge_ppo_data(ppo_buffers):
     data = [x.get() for x in ppo_buffers]
@@ -281,23 +295,40 @@ def merge_ppo_data(ppo_buffers):
         out[key] = torch.cat([x[key] for x in data])
     return out
 
-from torch import multiprocessing
 def main():
     epochs = 20
     ncpu = 4 # using 8 doesn't seem to help on an M1
     hero_strat = PPOStrategy(3)
     goblin_strat = PPOStrategy(2)
-    with multiprocessing.Pool(ncpu) as pool:
-        for epoch in range(epochs):
-            results = pool.map(run_epoch, ((1000//ncpu, hero_strat, goblin_strat) for _ in range(ncpu)))
-            wins = np.array([x[0] for x in results]) * ncpu
-            print(f"{wins.mean():.0f} ± {wins.std():.1f}")
-            hero_data = merge_ppo_data([x[1] for x in results])
-            hero_strat.update(hero_data)
-            hero_strat.buf.reset() # not sure if this is needed
-            # goblin_data = merge_ppo_data([x[2] for x in results])
-            # goblin_strat.update(goblin_data)
-            # goblin_strat.buf.reset() # not sure if this is needed
+    pipes = []
+    processes = []
+    for i in range(ncpu):
+        p1, p2 = multiprocessing.Pipe()
+        proc = multiprocessing.Process(target=run_epochs, kwargs=dict(
+            rank = i,
+            pipe = p2,
+            hero_strat = hero_strat,
+            goblin_strat = goblin_strat,
+        ))
+        proc.start()
+        processes.append(proc)
+        pipes.append(p1)
+    for epoch in range(epochs):
+        t1 = time.time()
+        _ = [p.send(1000//ncpu) for p in pipes]
+        results = [p.recv() for p in pipes]
+        t2 = time.time()
+        wins = np.array([x[0] for x in results]) * ncpu
+        hero_data = merge_ppo_data([x[1] for x in results])
+        hero_strat.update(hero_data)
+        goblin_data = merge_ppo_data([x[2] for x in results])
+        goblin_strat.update(goblin_data)
+        t3 = time.time()
+        print(f"{wins.mean():.0f} ± {wins.std():.0f} wins in {t2-t1:.1f} + {t3-t2:.1f} sec with {len(hero_data['obs'])} + {len(goblin_data['obs'])} obs")
+    for p in pipes:
+        p.send(None)
+    for p in processes:
+        p.join()
 
 if __name__ == '__main__':
     main()
