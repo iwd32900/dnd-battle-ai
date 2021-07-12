@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 
 from __future__ import annotations # allows forward declaration of types
-import itertools
+import csv
+import os
 import re
 import time
 import numpy as np
@@ -9,6 +10,13 @@ import torch
 from torch import multiprocessing
 import ppo_clip
 rnd = np.random.default_rng()
+
+MAX_TURNS = 100
+MAX_CHARS = 3
+
+epoch_id = encounter_id = round_id = -1
+actions_csv = csv.writer(open(f"actions_{os.getpid()}.csv", "w"))
+actions_csv.writerow('epoch encounter round actor action target raw_hp obs_hp'.split())
 
 class Dice:
     def __init__(self, XdY: str):
@@ -74,9 +82,6 @@ class RandomCharacter(Character):
         target = rnd.choice(targets)
         action(actor=self, target=target)
 
-MAX_TURNS = 100
-MAX_CHARS = 3
-
 class PPOStrategy:
     def __init__(self, n_acts):
         self.n_acts = n_acts * MAX_CHARS
@@ -92,8 +97,6 @@ class PPOStrategy:
 
     def end_of_encounter(self):
         self.encounters += 1
-        # if self.encounters % 1000 == 0:
-        #     self.optim.update(self.buf)
 
     def update(self, data):
         self.optim.update(data)
@@ -193,6 +196,7 @@ class Dodge(Action):
         # target is irrelevant
         actor.dodging = True
         #print(f"{actor.name} used {self.name}")
+        actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, 0, 0])
 
 class MeleeAttack(Action):
     def __init__(self, name: str, to_hit: int, dmg_dice: str, dmg_type: str):
@@ -211,10 +215,14 @@ class MeleeAttack(Action):
         attack_roll = self.to_hit.roll_ad(advntg, disadv)
         if attack_roll >= target.ac:
             dmg_roll = self.dmg_dice.roll()
+            before_hp = target.hp
             target.damage(dmg_roll, self.dmg_type)
+            after_hp = target.hp
             #print(f"{actor.name} attacked {target.name} with {self.name} for {dmg_roll}")
+            actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, -dmg_roll, after_hp - before_hp])
         else:
-            pass #print(f"{actor.name} attacked {target.name} with {self.name} and missed")
+            #print(f"{actor.name} attacked {target.name} with {self.name} and missed")
+            actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, 0, 0])
 
 class HealingPotion(Action):
     def __init__(self, name: str, heal_dice: str, uses: int = 1):
@@ -232,9 +240,13 @@ class HealingPotion(Action):
         if self.is_forbidden():
             return
         heal_roll = self.heal_dice.roll()
+        before_hp = target.hp
         target.heal(heal_roll)
+        after_hp = target.hp
         self.uses -= 1
         #print(f"{actor.name} used {self.name} on {target.name} for {heal_roll}")
+        actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, heal_roll, after_hp - before_hp])
+
 
 class Environment:
     def __init__(self, characters):
@@ -243,6 +255,8 @@ class Environment:
     def run(self):
         chars = list(self.characters)
         rnd.shuffle(chars)
+        global round_id
+        round_id = 0
         while True:
             #print("== top of round ==")
             #print({c.name: c.hp for c in chars})
@@ -254,6 +268,7 @@ class Environment:
             active_teams = set(c.team for c in chars if c.hp > 0)
             if len(active_teams) <= 1:
                 break
+            round_id += 1
         #print({c.name: c.hp for c in chars})
         for actor in chars:
             actor.end_of_encounter(self)
@@ -266,8 +281,10 @@ def init_workers(strats):
     for s in strategies:
         s.alloc_buf()
 
-def run_epoch(n):
-    global strategies
+def run_epoch(args):
+    epoch_id_, n = args
+    global strategies, epoch_id, encounter_id
+    epoch_id = epoch_id_
     for s in strategies:
         s.buf.reset()
     hero = lambda: PPOCharacter(strategies[0], name='Hero', team=0, hp=20, ac=15, actions=[
@@ -283,7 +300,7 @@ def run_epoch(n):
             MeleeAttack('scimitar', +4, '1d6+2', 'slashing')
         ])
     wins = 0
-    for i in range(n):
+    for encounter_id in range(n):
         env = Environment([hero(), goblin(1), goblin(2)])
         if env.run(): wins += 1
     return [s.buf for s in strategies] + [wins]
@@ -307,7 +324,7 @@ def main():
     with multiprocessing.Pool(ncpu, init_workers, (strategies,)) as pool:
         for epoch in range(epochs):
             t1 = time.time()
-            results = pool.map(run_epoch, [1000//ncpu for _ in range(ncpu)])
+            results = pool.map(run_epoch, [(epoch, 1000//ncpu) for _ in range(ncpu)])
             # transpose results matrix so entries of same type are together
             results = list(zip(*results))
             t2 = time.time()
