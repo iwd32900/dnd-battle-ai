@@ -16,7 +16,7 @@ MAX_CHARS = 3
 
 epoch_id = encounter_id = round_id = -1
 actions_csv = csv.writer(open(f"actions_{os.getpid()}.csv", "w"))
-actions_csv.writerow('epoch encounter round actor action target raw_hp obs_hp'.split())
+actions_csv.writerow('epoch encounter round actor action target t_dodging t_weakest raw_hp obs_hp'.split())
 
 class Dice:
     def __init__(self, XdY: str):
@@ -174,13 +174,14 @@ class PPOCharacter(Character):
             #print(f"{self.name} has no allowable action/target pairs")
             return
 
-        obs = self.get_obs(env)
-        act, val, logp, pi = self.act_crit.step(obs, fbn)
-        rew = self.get_reward(env)
-        self.buf.store(obs, fbn, act, rew, val, logp)
-        act_idx = act.item()
-        target, action = chars_acts[act_idx]
-        action(actor=self, target=target)
+        with torch.no_grad():
+            obs = self.get_obs(env)
+            act, val, logp, pi = self.act_crit.step(obs, fbn)
+            rew = self.get_reward(env)
+            self.buf.store(obs, fbn, act, rew, val, logp)
+            act_idx = act.item()
+            target, action = chars_acts[act_idx]
+        action(actor=self, target=target, env=env)
 
 class Action:
     def is_forbidden(self):
@@ -192,11 +193,11 @@ class Action:
 class Dodge(Action):
     name = 'Dodge'
 
-    def __call__(self, actor: Character, target: Character):
+    def __call__(self, actor: Character, target: Character, env: Environment):
         # target is irrelevant
         actor.dodging = True
         #print(f"{actor.name} used {self.name}")
-        actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, 0, 0])
+        actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, False, False, 0, 0])
 
 class MeleeAttack(Action):
     def __init__(self, name: str, to_hit: int, dmg_dice: str, dmg_type: str):
@@ -208,10 +209,12 @@ class MeleeAttack(Action):
     def plausible_target(self, actor: Character, target: Character):
         return target.team != actor.team and target.hp > 0
 
-    def __call__(self, actor: Character, target: Character):
+    def __call__(self, actor: Character, target: Character, env: Environment):
         advntg = disadv = False
         if target.dodging:
             disadv = True
+        t_weakest = all(target.hp <= other.hp for other in env.characters if self.plausible_target(actor, other))
+        # all([]) == True, which seems ok
         attack_roll = self.to_hit.roll_ad(advntg, disadv)
         if attack_roll >= target.ac:
             dmg_roll = self.dmg_dice.roll()
@@ -219,10 +222,10 @@ class MeleeAttack(Action):
             target.damage(dmg_roll, self.dmg_type)
             after_hp = target.hp
             #print(f"{actor.name} attacked {target.name} with {self.name} for {dmg_roll}")
-            actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, -dmg_roll, after_hp - before_hp])
+            actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, target.dodging, t_weakest, -dmg_roll, after_hp - before_hp])
         else:
             #print(f"{actor.name} attacked {target.name} with {self.name} and missed")
-            actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, 0, 0])
+            actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, target.dodging, t_weakest, 0, 0])
 
 class HealingPotion(Action):
     def __init__(self, name: str, heal_dice: str, uses: int = 1):
@@ -236,16 +239,18 @@ class HealingPotion(Action):
     def plausible_target(self, actor: Character, target: Character):
         return target.team == actor.team and target.hp < target.max_hp
 
-    def __call__(self, actor: Character, target: Character):
+    def __call__(self, actor: Character, target: Character, env: Environment):
         if self.is_forbidden():
             return
+        t_weakest = all(target.hp <= other.hp for other in env.characters if self.plausible_target(actor, other))
+        # all([]) == True, which seems ok
         heal_roll = self.heal_dice.roll()
         before_hp = target.hp
         target.heal(heal_roll)
         after_hp = target.hp
         self.uses -= 1
         #print(f"{actor.name} used {self.name} on {target.name} for {heal_roll}")
-        actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, heal_roll, after_hp - before_hp])
+        actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, target.dodging, t_weakest, heal_roll, after_hp - before_hp])
 
 
 class Environment:
@@ -291,8 +296,8 @@ def run_epoch(args):
             Dodge(),
             MeleeAttack('long sword', +3, '1d8+1', 'slashing'),
             #MeleeAttack('greataxe', +3, '1d12+1', 'slashing'),
-            #HealingPotion('potion of healing', '2d4+2', uses=3),
-            HealingPotion('potion of greater healing', '4d4+4', uses=3),
+            HealingPotion('potion of healing', '2d4+2', uses=3),
+            #HealingPotion('potion of greater healing', '4d4+4', uses=3),
         ])
     #goblin = lambda i: RandomCharacter(f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
     goblin = lambda i: PPOCharacter(strategies[1], survival=0, name=f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
@@ -318,7 +323,7 @@ def merge_ppo_data(ppo_buffers):
     return out
 
 def main():
-    epochs = 20
+    epochs = 100
     ncpu = 4 # using 8 doesn't seem to help on an M1
     strategies = [PPOStrategy(3), PPOStrategy(2)]
     with multiprocessing.Pool(ncpu, init_workers, (strategies,)) as pool:
