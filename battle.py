@@ -2,6 +2,7 @@
 
 from __future__ import annotations # allows forward declaration of types
 import csv
+import enum
 import os
 import re
 import time
@@ -13,6 +14,10 @@ rnd = np.random.default_rng()
 
 MAX_TURNS = 100
 MAX_CHARS = 3
+OBS_SIZE = 3 * MAX_CHARS
+HP_SCALE = 20 # roughly, max HP across all entities in the battle (but a fixed constant, not rolled dice!)
+
+Ability = enum.IntEnum('Ability', 'STR DEX CON INT WIS CHA', start=0)
 
 epoch_id = encounter_id = round_id = -1
 actions_csv = csv.writer(open(f"actions_{os.getpid()}.csv", "w"))
@@ -43,12 +48,18 @@ def roll(XdY: str):
     return Dice(XdY).roll()
 
 class Character:
-    def __init__(self, name: str, team: int, hp: int, ac: int, actions: list[Action]):
+    def __init__(self, name: str, team: int, hp: int, ac: int, actions: list[Action],
+                 ability_mods: list[int] = [0]*6, saving_throws: list[int] =[0]*6,
+                 spells: list[int] = [0]*9):
         self.name = name
         self.team = team
         self.max_hp = self.hp = hp
         self.ac = ac
         self.actions = actions
+        self.ability_mods = list(ability_mods)
+        self.saving_throws = list(saving_throws)
+        self.max_spells = np.array(spells, dtype=int)
+        self.curr_spells = self.max_spells.copy()
         self.start_of_round() # initializes some properties
 
     def start_of_round(self):
@@ -85,15 +96,18 @@ class RandomCharacter(Character):
 class PPOStrategy:
     def __init__(self, n_acts):
         self.n_acts = n_acts * MAX_CHARS
-        self.obs_dim = 5 * MAX_CHARS
+        self.obs_dim = OBS_SIZE
         self.act_crit = ppo_clip.MLPActorCritic(self.obs_dim, self.n_acts, hidden_sizes=[32])
         self.act_crit.share_memory() # docs say this is required, but doesn't seem to be?
-        self.optim = ppo_clip.PPOAlgo(self.act_crit) #, pi_lr=1e-4)
+        # https://bair.berkeley.edu/blog/2021/07/14/mappo/ suggests that smaller clip (0.2) and
+        # fewer iters (5-15) stabilizes learning with PPO in multi-agent settings?
+        # So far, I don't see a benefit.
+        self.optim = ppo_clip.PPOAlgo(self.act_crit) # pi_lr=3e-4, vf_lr=1e-3, clip_ratio=0.2, train_pi_iters=15, train_v_iters=15
         self.encounters = 0
 
     def alloc_buf(self):
         # Wait to allocate the buffers until we're in worker processes, so we don't trample the same memory
-        self.buf = ppo_clip.PPOBuffer(self.obs_dim, self.n_acts, act_dim=None, size=1000 * 5 * MAX_TURNS)
+        self.buf = ppo_clip.PPOBuffer(self.obs_dim, self.n_acts, act_dim=None, size=1000 * OBS_SIZE * MAX_TURNS)
 
     def end_of_encounter(self):
         self.encounters += 1
@@ -110,8 +124,11 @@ class PPOCharacter(Character):
         self.buf = ppo_strat.buf
         self.survival = survival
         self.old_hp_score = 0
+        self.prev_OFAVL = None # state tuple from previous reward
 
     def end_of_encounter(self, env):
+        # all consequences of last action are now apparent, so can calc reward for it
+        self.save_experience(env)
         self.buf.finish_path(self.get_reward(env))
         self.ppo_strat.end_of_encounter()
 
@@ -119,12 +136,14 @@ class PPOCharacter(Character):
         obs = []
         for c in env.characters:
             obs.extend([
-                #c.team == self.team,    # on our team? same for whole training run, so useless
-                c == self,              # ourself? maybe useful when 1 AI plays many monsters
-                c.max_hp / self.max_hp, # stronger or weaker than us?
-                c.hp / c.max_hp,        # hurt or healthy?
-                (c.ac - 10) / 10,       # armor class
-                c.dodging,              # taking Dodge action?
+                #c.team == self.team,           # On our team? Same for whole training run, so useless.
+                #(c.ac - 10) / 10,              # Armor class.  Right now, does not change.
+                c == self,                      # Ourself? maybe useful when 1 AI plays many monsters
+                (c.max_hp - c.hp) / HP_SCALE,   # Absolute hp lost -- we can track this as a player.
+                c.dodging,                      # Taking Dodge action?
+                # Below this point is cheating -- info not available to players, only DM
+                #c.hp / HP_SCALE,               # current absolute health
+                #c.max_hp / self.max_hp,        # Stronger or weaker than us? Varies if hp are rolled.
             ])
         return torch.tensor(obs, dtype=torch.float32)
 
@@ -162,7 +181,21 @@ class PPOCharacter(Character):
     def get_reward(self, env):
         return self.get_hp_reward(env)
 
+    def save_experience(self, env):
+        rew = self.get_reward(env)
+        if self.prev_OFAVL is None:
+            # First action.  Any HP losses before this are independent of our actions,
+            # so shouldn't count toward our rewards.
+            pass
+        else:
+            obs, fbn, act, val, logp = self.prev_OFAVL
+            self.buf.store(obs, fbn, act, rew, val, logp)
+        self.prev_OFAVL = None
+
     def act(self, env):
+        # all consequences of last action are now apparent, so can calc reward for it
+        self.save_experience(env)
+
         chars_acts = []
         fbn = []
         for c in env.characters:
@@ -177,10 +210,9 @@ class PPOCharacter(Character):
         with torch.no_grad():
             obs = self.get_obs(env)
             act, val, logp, pi = self.act_crit.step(obs, fbn)
-            rew = self.get_reward(env)
-            self.buf.store(obs, fbn, act, rew, val, logp)
             act_idx = act.item()
             target, action = chars_acts[act_idx]
+        self.prev_OFAVL = (obs, fbn, act, val, logp)
         action(actor=self, target=target, env=env)
 
 class Action:
@@ -192,6 +224,10 @@ class Action:
 
 class Dodge(Action):
     name = 'Dodge'
+
+    def plausible_target(self, actor: Character, target: Character):
+        # This way, there's one unique (legal) Dodge action, instead of one per opponent
+        return actor == target
 
     def __call__(self, actor: Character, target: Character, env: Environment):
         # target is irrelevant

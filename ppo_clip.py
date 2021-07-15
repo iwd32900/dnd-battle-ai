@@ -93,31 +93,33 @@ class MLPCategoricalActor(Actor):
         # to zero or close to it.  Actually zeroing may cause some math problems...
         # logits[fbn] = -1e30 # = -np.inf # -np.inf causes NaNs in Categorical.entropy()
         # Log probs can all be shifted by a constant without changing probability distribution.
-        logits[fbn] -= self.log_fbn_eps # reduce probability to near zero
+        #logits[fbn] -= self.log_fbn_eps # reduce probability, may still be significant if original value was high...
+        logits[fbn] = logits.detach()[~fbn].min() - self.log_fbn_eps # reduce probability to near zero relative to allowed actions
         pi = Categorical(logits=logits)
         # Paper seems to recommend this route instead:  https://arxiv.org/abs/2006.14171
         # pi.probs[fbn] = 1e-6 # mask out forbidden (disallowed) actions, avoiding zero prob which can cause NaNs
         # pi = Categorical(probs=pi.probs) # force re-normalization of probs to sum to 1
+        # ^ I believe this is equivalent to the `min() - eps` line above
         return pi
 
     def _log_prob_from_distribution(self, pi, act):
         return pi.log_prob(act)
 
-class MLPGaussianActor(Actor):
+# class MLPGaussianActor(Actor):
 
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
-        super().__init__()
-        log_std = -0.5 * np.ones(act_dim, dtype=np.float32)
-        self.log_std = torch.nn.Parameter(torch.as_tensor(log_std))
-        self.mu_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
+#     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+#         super().__init__()
+#         log_std = -0.5 * np.ones(act_dim, dtype=np.float32)
+#         self.log_std = torch.nn.Parameter(torch.as_tensor(log_std))
+#         self.mu_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
 
-    def _distribution(self, obs):
-        mu = self.mu_net(obs)
-        std = torch.exp(self.log_std)
-        return Normal(mu, std)
+#     def _distribution(self, obs):
+#         mu = self.mu_net(obs)
+#         std = torch.exp(self.log_std)
+#         return Normal(mu, std)
 
-    def _log_prob_from_distribution(self, pi, act):
-        return pi.log_prob(act).sum(axis=-1)    # Last axis sum needed for Torch Normal distribution
+#     def _log_prob_from_distribution(self, pi, act):
+#         return pi.log_prob(act).sum(axis=-1)    # Last axis sum needed for Torch Normal distribution
 
 class MLPCritic(nn.Module):
 
