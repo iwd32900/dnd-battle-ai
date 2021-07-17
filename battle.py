@@ -13,7 +13,7 @@ import ppo_clip
 rnd = np.random.default_rng()
 
 MAX_TURNS = 100
-MAX_CHARS = 3
+MAX_CHARS = 5
 OBS_SIZE = 3 * MAX_CHARS
 HP_SCALE = 20 # roughly, max HP across all entities in the battle (but a fixed constant, not rolled dice!)
 
@@ -30,36 +30,45 @@ class Dice:
         self.num_dice = int(g[0] or 1)
         self.dice_type = int(g[1])
         self.bonus = int(g[2] or 0)
-    def roll(self) -> int:
-        rolls = rnd.integers(low=1, high=self.dice_type, endpoint=True, size=self.num_dice)
+    def roll(self, crit_hit: bool = False) -> int:
+        rolls = rnd.integers(low=1, high=self.dice_type, endpoint=True, size=self.num_dice * (2 if crit_hit else 1))
         # D&D rules: even if bonus is negative, total can't fall below 1
         result = max(1, rolls.sum() + self.bonus)
         #print(rolls, result)
         return result
-    def roll_ad(self, advantage: bool, disadvantage: bool) -> int:
+
+class D20:
+    def __init__(self, bonus: int):
+        self.bonus = bonus
+    def roll(self, advantage: bool = False, disadvantage: bool = False):
+        rolls = rnd.integers(low=1, high=20, endpoint=True, size=2)
         if advantage and not disadvantage:
-            return max(self.roll(), self.roll())
+            base_roll = rolls.max()
         elif disadvantage and not advantage:
-            return min(self.roll(), self.roll())
+            base_roll = rolls.min()
         else:
-            return self.roll()
+            base_roll = rolls[0]
+        mod_roll = max(1, base_roll + self.bonus)
+        return mod_roll, base_roll
 
 def roll(XdY: str):
     return Dice(XdY).roll()
 
 class Character:
     def __init__(self, name: str, team: int, hp: int, ac: int, actions: list[Action],
-                 ability_mods: list[int] = [0]*6, saving_throws: list[int] =[0]*6,
-                 spells: list[int] = [0]*9):
+                 ability_mods: list[int] = [0]*6, saving_throws: list[int] = None,
+                 spells: list[int] = [0]*9, spell_attack=2, spell_save=10):
         self.name = name
         self.team = team
         self.max_hp = self.hp = hp
         self.ac = ac
         self.actions = actions
         self.ability_mods = list(ability_mods)
-        self.saving_throws = list(saving_throws)
+        self.saving_throws = list(saving_throws or ability_mods) # if None, default == to ability_mods
         self.max_spells = np.array(spells, dtype=int)
         self.curr_spells = self.max_spells.copy()
+        self.spell_attack = D20(spell_attack)
+        self.spell_save_dc = spell_save
         self.start_of_round() # initializes some properties
 
     def start_of_round(self):
@@ -81,7 +90,7 @@ class Character:
 
 class RandomCharacter(Character):
     def act(self, env):
-        actions = [a for a in self.actions if not a.is_forbidden()]
+        actions = [a for a in self.actions if not a.is_forbidden(self, env)]
         if not actions:
             #print(f"{self.name} has no allowable actions")
             return
@@ -201,7 +210,7 @@ class PPOCharacter(Character):
         for c in env.characters:
             for a in self.actions:
                 chars_acts.append((c,a))
-                fbn.append(a.is_forbidden() or not a.plausible_target(self, c))
+                fbn.append(a.is_forbidden(self, env) or not a.plausible_target(self, c))
         fbn = np.array(fbn)
         if fbn.all():
             #print(f"{self.name} has no allowable action/target pairs")
@@ -216,11 +225,17 @@ class PPOCharacter(Character):
         action(actor=self, target=target, env=env)
 
 class Action:
-    def is_forbidden(self):
+    def is_forbidden(self, actor: Character, env: Environment):
         return False
 
     def plausible_target(self, actor: Character, target: Character):
         return True
+
+    def _conscious_ally(self, actor: Character, target: Character):
+        return target.team == actor.team and target.hp > 0
+
+    def _conscious_enemy(self, actor: Character, target: Character):
+        return target.team != actor.team and target.hp > 0
 
 class Dodge(Action):
     name = 'Dodge'
@@ -238,7 +253,7 @@ class Dodge(Action):
 class MeleeAttack(Action):
     def __init__(self, name: str, to_hit: int, dmg_dice: str, dmg_type: str):
         self.name = name
-        self.to_hit = Dice(f'd20+{to_hit}')
+        self.to_hit = D20(to_hit)
         self.dmg_dice = Dice(dmg_dice)
         self.dmg_type = dmg_type
 
@@ -251,9 +266,10 @@ class MeleeAttack(Action):
             disadv = True
         t_weakest = all(target.hp <= other.hp for other in env.characters if self.plausible_target(actor, other))
         # all([]) == True, which seems ok
-        attack_roll = self.to_hit.roll_ad(advntg, disadv)
-        if attack_roll >= target.ac:
-            dmg_roll = self.dmg_dice.roll()
+        attack_roll, nat_roll = self.to_hit.roll(advntg, disadv)
+        crit_hit = (nat_roll == 20)
+        if (attack_roll >= target.ac or crit_hit) and nat_roll != 1:
+            dmg_roll = self.dmg_dice.roll(crit_hit=crit_hit)
             before_hp = target.hp
             target.damage(dmg_roll, self.dmg_type)
             after_hp = target.hp
@@ -269,14 +285,14 @@ class HealingPotion(Action):
         self.heal_dice = Dice(heal_dice)
         self.uses = uses
 
-    def is_forbidden(self):
+    def is_forbidden(self, actor: Character, env: Environment):
         return (self.uses <= 0)
 
     def plausible_target(self, actor: Character, target: Character):
         return target.team == actor.team and target.hp < target.max_hp
 
     def __call__(self, actor: Character, target: Character, env: Environment):
-        if self.is_forbidden():
+        if self.is_forbidden(actor, env):
             return
         t_weakest = all(target.hp <= other.hp for other in env.characters if self.plausible_target(actor, other))
         # all([]) == True, which seems ok
@@ -288,14 +304,81 @@ class HealingPotion(Action):
         #print(f"{actor.name} used {self.name} on {target.name} for {heal_roll}")
         actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, target.dodging, t_weakest, heal_roll, after_hp - before_hp])
 
+class Spell(Action):
+    # def __init__(self, name: str, level: int, concentration: bool = False):
+    #     self.name = name
+    #     self.level = level # 0 for cantrips
+    #     self.concentration = concentration
+
+    def is_forbidden(self, actor: Character, env: Environment):
+        return self.level > 0 and actor.curr_spells[self.level-1] <= 0
+
+    def _consume_slot(self, actor: Character):
+        if self.level > 0: actor.curr_spells[self.level-1] -= 1
+
+    def _spell_attack(self, actor: Character, target: Character, env: Environment, dmg_dice: Dice, dmg_type: str):
+        advntg = disadv = False
+        if target.dodging:
+            disadv = True # TODO: does this affect spells?
+        t_weakest = all(target.hp <= other.hp for other in env.characters if self.plausible_target(actor, other))
+        # all([]) == True, which seems ok
+        attack_roll, nat_roll = actor.spell_attack.roll(advntg, disadv)
+        if (attack_roll >= target.ac or nat_roll == 20) and nat_roll != 1:
+            dmg_roll = dmg_dice.roll()
+            before_hp = target.hp
+            target.damage(dmg_roll, dmg_type)
+            after_hp = target.hp
+            actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, target.dodging, t_weakest, -dmg_roll, after_hp - before_hp])
+        else:
+            actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, target.dodging, t_weakest, 0, 0])
+
+    def __call__(self, actor: Character, target: Character, env: Environment):
+        if self.is_forbidden(actor, env): return
+        self._consume_slot(actor)
+        self.call(actor, target, env)
+
+class MageArmor(Spell):
+    name = 'Mage Armor'
+    level = 1
+    concentration = False
+    plausible_target = Action._conscious_ally
+
+    def call(self, actor: Character, target: Character, env: Environment):
+        target.ac = 13 + target.ability_mods[Ability.DEX]
+        actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, target.dodging, False, 0, 0])
+
+class MagicMissle(Spell):
+    name = 'Magic Missle'
+    level = 1
+    concentration = False
+    plausible_target = Action._conscious_enemy
+
+    def call(self, actor: Character, target: Character, env: Environment):
+        # Automatically hits.  TODO:  should be able to target multiple opponents
+        t_weakest = all(target.hp <= other.hp for other in env.characters if self.plausible_target(actor, other))
+        dmg_roll = roll('3d4+3')
+        before_hp = target.hp
+        target.damage(dmg_roll, 'force')
+        after_hp = target.hp
+        actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, target.dodging, t_weakest, -dmg_roll, after_hp - before_hp])
+
+class RayOfFrost(Spell):
+    name = 'Ray of Frost'
+    level = 0 # cantrip
+    concentration = False
+    plausible_target = Action._conscious_enemy
+
+    def call(self, actor: Character, target: Character, env: Environment):
+        self._spell_attack(actor, target, env, Dice('1d8'), 'cold')
 
 class Environment:
     def __init__(self, characters):
+        assert len(characters) == MAX_CHARS
         self.characters = characters
 
     def run(self):
         chars = list(self.characters)
-        rnd.shuffle(chars)
+        rnd.shuffle(chars) # TODO: this is not proper initiative rules!
         global round_id
         round_id = 0
         while True:
@@ -328,21 +411,35 @@ def run_epoch(args):
     epoch_id = epoch_id_
     for s in strategies:
         s.buf.reset()
-    hero = lambda: PPOCharacter(strategies[0], name='Hero', team=0, hp=20, ac=15, actions=[
+    fighter_lvl2 = lambda i: PPOCharacter(strategies[0], name=f'Fighter {i}', team=0, hp=20, ac=18, actions=[
             Dodge(),
-            MeleeAttack('long sword', +3, '1d8+1', 'slashing'),
-            #MeleeAttack('greataxe', +3, '1d12+1', 'slashing'),
+            MeleeAttack('long sword', +5, '1d8+3', 'slashing'),
             HealingPotion('potion of healing', '2d4+2', uses=3),
             #HealingPotion('potion of greater healing', '4d4+4', uses=3),
-        ])
+        ],
+        ability_mods=[3,2,2,-1,1,0], saving_throws=[5,2,4,-1,1,0])
+    wizard_lvl2 = lambda i: PPOCharacter(strategies[1], name=f'Wizard {i}', team=0, hp=14, ac=12, actions=[
+            Dodge(),
+            #MeleeAttack('quarterstaff (two-handed)', +1, '1d8-1', 'bludgeoning'), # worse hit & damage than dagger
+            MeleeAttack('dagger', +4, '1d4+2', 'piercing'),
+            MageArmor(),
+            MagicMissle(),
+            RayOfFrost(), # better hit & same damage as dagger
+            # Sleep
+            # Witch Bolt -- too much state tracking!
+            # Charm Person?
+        ],
+        ability_mods=[-1,2,2,3,1,0], saving_throws=[-1,2,2,5,3,0],
+        spells=[3,0,0,0,0,0,0,0,0], spell_attack=5, spell_save=13)
     #goblin = lambda i: RandomCharacter(f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
-    goblin = lambda i: PPOCharacter(strategies[1], survival=0, name=f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
+    goblin = lambda i: PPOCharacter(strategies[2], survival=0, name=f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
             Dodge(),
             MeleeAttack('scimitar', +4, '1d6+2', 'slashing')
-        ])
+        ],
+        ability_mods=[-1,2,0,0,-1,1])
     wins = 0
     for encounter_id in range(n):
-        env = Environment([hero(), goblin(1), goblin(2)])
+        env = Environment([fighter_lvl2(1), wizard_lvl2(1), goblin(1), goblin(2), goblin(3)])
         if env.run(): wins += 1
     return [s.buf for s in strategies] + [wins]
 
@@ -361,7 +458,7 @@ def merge_ppo_data(ppo_buffers):
 def main():
     epochs = 100
     ncpu = 4 # using 8 doesn't seem to help on an M1
-    strategies = [PPOStrategy(3), PPOStrategy(2)]
+    strategies = [PPOStrategy(3), PPOStrategy(5), PPOStrategy(2)]
     with multiprocessing.Pool(ncpu, init_workers, (strategies,)) as pool:
         for epoch in range(epochs):
             t1 = time.time()
