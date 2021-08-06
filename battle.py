@@ -14,7 +14,7 @@ rnd = np.random.default_rng()
 
 MAX_TURNS = 100
 MAX_CHARS = 5
-OBS_SIZE = 3 * MAX_CHARS
+OBS_SIZE = 4 * MAX_CHARS
 HP_SCALE = 20 # roughly, max HP across all entities in the battle (but a fixed constant, not rolled dice!)
 
 Ability = enum.IntEnum('Ability', 'STR DEX CON INT WIS CHA', start=0)
@@ -22,6 +22,8 @@ Ability = enum.IntEnum('Ability', 'STR DEX CON INT WIS CHA', start=0)
 epoch_id = encounter_id = round_id = -1
 actions_csv = csv.writer(open(f"actions_{os.getpid()}.csv", "w"))
 actions_csv.writerow('epoch encounter round actor action target t_dodging t_weakest raw_hp obs_hp'.split())
+outcomes_csv = csv.writer(open(f"outcomes_{os.getpid()}.csv", "w"))
+outcomes_csv.writerow('epoch encounter num_rounds actor team team_win max_hp final_hp'.split())
 
 class Dice:
     def __init__(self, XdY: str):
@@ -69,6 +71,7 @@ class Character:
         self.curr_spells = self.max_spells.copy()
         self.spell_attack = D20(spell_attack)
         self.spell_save_dc = spell_save
+        self.unconscious = False
         self.start_of_round() # initializes some properties
 
     def start_of_round(self):
@@ -77,9 +80,19 @@ class Character:
     def end_of_encounter(self, env):
         pass
 
+    def saving_throw(self, save_dc: int, ability: Ability, advantage: bool = False, disadvantage: bool = False):
+        "Returns True if the save succeeds and False if it fails"
+        if self.unconscious and ability in [Ability.STR, Ability.DEX]:
+            return False
+        mod_roll, nat_roll = D20(self.saving_throws[ability]).roll(advantage=advantage, disadvantage=disadvantage)
+        if nat_roll == 1: return False
+        elif nat_roll == 20: return True
+        else: return mod_roll >= save_dc
+
     def damage(self, dmg_hp: int, dmg_type: str):
         "Apply damage to this character"
         self.hp = max(0, self.hp - dmg_hp)
+        self.unconscious = False
 
     def heal(self, heal_hp: int):
         "Apply healing to this character"
@@ -149,6 +162,7 @@ class PPOCharacter(Character):
                 #(c.ac - 10) / 10,              # Armor class.  Right now, does not change.
                 c == self,                      # Ourself? maybe useful when 1 AI plays many monsters
                 (c.max_hp - c.hp) / HP_SCALE,   # Absolute hp lost -- we can track this as a player.
+                c.unconscious,                  # Unconscious (not counting hp <= 0)
                 c.dodging,                      # Taking Dodge action?
                 # Below this point is cheating -- info not available to players, only DM
                 #c.hp / HP_SCALE,               # current absolute health
@@ -231,23 +245,36 @@ class Action:
     def plausible_target(self, actor: Character, target: Character):
         return True
 
+    def _self_only(self, actor: Character, target: Character):
+        # This is a good choice for Actions without an explicit target, like Dodge, so there's just one unique choice
+        return actor == target
+
     def _conscious_ally(self, actor: Character, target: Character):
         return target.team == actor.team and target.hp > 0
+
+    def _unconscious_ally(self, actor: Character, target: Character):
+        return target.team == actor.team and target.unconscious
 
     def _conscious_enemy(self, actor: Character, target: Character):
         return target.team != actor.team and target.hp > 0
 
 class Dodge(Action):
     name = 'Dodge'
-
-    def plausible_target(self, actor: Character, target: Character):
-        # This way, there's one unique (legal) Dodge action, instead of one per opponent
-        return actor == target
+    plausible_target = Action._self_only
+    # This way, there's one unique (legal) Dodge action, instead of one per opponent
 
     def __call__(self, actor: Character, target: Character, env: Environment):
         # target is irrelevant
         actor.dodging = True
         #print(f"{actor.name} used {self.name}")
+        actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, False, False, 0, 0])
+
+class Awaken(Action):
+    name = 'Awaken'
+    plausible_target = Action._unconscious_ally
+
+    def __call__(self, actor: Character, target: Character, env: Environment):
+        target.unconscious = False
         actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, target.name, False, False, 0, 0])
 
 class MeleeAttack(Action):
@@ -267,8 +294,8 @@ class MeleeAttack(Action):
         t_weakest = all(target.hp <= other.hp for other in env.characters if self.plausible_target(actor, other))
         # all([]) == True, which seems ok
         attack_roll, nat_roll = self.to_hit.roll(advntg, disadv)
-        crit_hit = (nat_roll == 20)
-        if (attack_roll >= target.ac or crit_hit) and nat_roll != 1:
+        if (attack_roll >= target.ac or nat_roll == 20) and nat_roll != 1:
+            crit_hit = (nat_roll == 20) or target.unconscious
             dmg_roll = self.dmg_dice.roll(crit_hit=crit_hit)
             before_hp = target.hp
             target.damage(dmg_roll, self.dmg_type)
@@ -324,7 +351,8 @@ class Spell(Action):
         # all([]) == True, which seems ok
         attack_roll, nat_roll = actor.spell_attack.roll(advntg, disadv)
         if (attack_roll >= target.ac or nat_roll == 20) and nat_roll != 1:
-            dmg_roll = dmg_dice.roll()
+            crit_hit = (nat_roll == 20) or target.unconscious # critical hits work with spell attacks too
+            dmg_roll = dmg_dice.roll(crit_hit=crit_hit)
             before_hp = target.hp
             target.damage(dmg_roll, dmg_type)
             after_hp = target.hp
@@ -371,6 +399,27 @@ class RayOfFrost(Spell):
     def call(self, actor: Character, target: Character, env: Environment):
         self._spell_attack(actor, target, env, Dice('1d8'), 'cold')
 
+class Sleep(Spell):
+    name = 'Sleep'
+    level = 1
+    concentration = False
+    plausible_target = Action._self_only
+    # maybe this should be _conscious_enemy instead, if we factor out actions vs. targets?
+
+    def call(self, actor: Character, target: Character, env: Environment):
+        orig_hp = hp = roll('5d8')
+        targets = [c for c in env.characters if c.team != actor.team and c.hp > 0 and not c.unconscious]
+        targets.sort(key=lambda c: c.hp)
+        t_names = []
+        for target in targets:
+            if target.hp <= hp:
+                target.unconscious = True
+                hp -= target.hp
+                t_names.append(target.name)
+            else:
+                break
+        actions_csv.writerow([epoch_id, encounter_id, round_id, actor.name, self.name, '/'.join(t_names), False, False, -orig_hp, -(orig_hp - hp)])
+
 class Environment:
     def __init__(self, characters):
         assert len(characters) == MAX_CHARS
@@ -378,7 +427,9 @@ class Environment:
 
     def run(self):
         chars = list(self.characters)
-        rnd.shuffle(chars) # TODO: this is not proper initiative rules!
+        # Initiative:
+        rnd.shuffle(chars) # this ensures ties are broken randomly
+        chars.sort(key=lambda c: D20(c.ability_mods[Ability.DEX]).roll(), reverse=True) # key() is called once per item and cached
         global round_id
         round_id = 0
         while True:
@@ -386,7 +437,7 @@ class Environment:
             #print({c.name: c.hp for c in chars})
             for actor in chars:
                 actor.start_of_round()
-                if actor.hp <= 0:
+                if actor.hp <= 0 or actor.unconscious:
                     continue
                 actor.act(self)
             active_teams = set(c.team for c in chars if c.hp > 0)
@@ -396,6 +447,11 @@ class Environment:
         #print({c.name: c.hp for c in chars})
         for actor in chars:
             actor.end_of_encounter(self)
+            outcomes_csv.writerow([
+                epoch_id, encounter_id, round_id+1,
+                actor.name, actor.team, (actor.team in active_teams),
+                actor.max_hp, actor.hp
+            ])
         return (0 in active_teams)
 
 def init_workers(strats):
@@ -413,6 +469,7 @@ def run_epoch(args):
         s.buf.reset()
     fighter_lvl2 = lambda i: PPOCharacter(strategies[0], name=f'Fighter {i}', team=0, hp=20, ac=18, actions=[
             Dodge(),
+            Awaken(),
             MeleeAttack('long sword', +5, '1d8+3', 'slashing'),
             HealingPotion('potion of healing', '2d4+2', uses=3),
             #HealingPotion('potion of greater healing', '4d4+4', uses=3),
@@ -420,12 +477,13 @@ def run_epoch(args):
         ability_mods=[3,2,2,-1,1,0], saving_throws=[5,2,4,-1,1,0])
     wizard_lvl2 = lambda i: PPOCharacter(strategies[1], name=f'Wizard {i}', team=0, hp=14, ac=12, actions=[
             Dodge(),
+            Awaken(),
             #MeleeAttack('quarterstaff (two-handed)', +1, '1d8-1', 'bludgeoning'), # worse hit & damage than dagger
             MeleeAttack('dagger', +4, '1d4+2', 'piercing'),
             MageArmor(),
             MagicMissle(),
             RayOfFrost(), # better hit & same damage as dagger
-            # Sleep
+            Sleep(),
             # Witch Bolt -- too much state tracking!
             # Charm Person?
         ],
@@ -434,6 +492,7 @@ def run_epoch(args):
     #goblin = lambda i: RandomCharacter(f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
     goblin = lambda i: PPOCharacter(strategies[2], survival=0, name=f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
             Dodge(),
+            Awaken(),
             MeleeAttack('scimitar', +4, '1d6+2', 'slashing')
         ],
         ability_mods=[-1,2,0,0,-1,1])
@@ -458,7 +517,7 @@ def merge_ppo_data(ppo_buffers):
 def main():
     epochs = 100
     ncpu = 4 # using 8 doesn't seem to help on an M1
-    strategies = [PPOStrategy(3), PPOStrategy(5), PPOStrategy(2)]
+    strategies = [PPOStrategy(4), PPOStrategy(7), PPOStrategy(3)]
     with multiprocessing.Pool(ncpu, init_workers, (strategies,)) as pool:
         for epoch in range(epochs):
             t1 = time.time()
