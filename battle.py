@@ -13,7 +13,7 @@ import ppo_clip
 rnd = np.random.default_rng()
 
 MAX_TURNS = 100
-MAX_CHARS = 5
+MAX_CHARS = 4 + 5
 OBS_SIZE = 4 * MAX_CHARS
 HP_SCALE = 20 # roughly, max HP across all entities in the battle (but a fixed constant, not rolled dice!)
 
@@ -469,7 +469,7 @@ def run_epoch(args):
         s.buf.reset()
     fighter_lvl2 = lambda i: PPOCharacter(strategies[0], name=f'Fighter {i}', team=0, hp=20, ac=18, actions=[
             Dodge(),
-            Awaken(),
+            #Awaken(),
             MeleeAttack('long sword', +5, '1d8+3', 'slashing'),
             HealingPotion('potion of healing', '2d4+2', uses=3),
             #HealingPotion('potion of greater healing', '4d4+4', uses=3),
@@ -477,13 +477,13 @@ def run_epoch(args):
         ability_mods=[3,2,2,-1,1,0], saving_throws=[5,2,4,-1,1,0])
     wizard_lvl2 = lambda i: PPOCharacter(strategies[1], name=f'Wizard {i}', team=0, hp=14, ac=12, actions=[
             Dodge(),
-            Awaken(),
+            #Awaken(),
             #MeleeAttack('quarterstaff (two-handed)', +1, '1d8-1', 'bludgeoning'), # worse hit & damage than dagger
-            MeleeAttack('dagger', +4, '1d4+2', 'piercing'),
+            #MeleeAttack('dagger', +4, '1d4+2', 'piercing'), # worse hit than RayOfFrost
             MageArmor(),
             MagicMissle(),
             RayOfFrost(), # better hit & same damage as dagger
-            Sleep(),
+            #Sleep(),
             # Witch Bolt -- too much state tracking!
             # Charm Person?
         ],
@@ -492,13 +492,15 @@ def run_epoch(args):
     #goblin = lambda i: RandomCharacter(f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
     goblin = lambda i: PPOCharacter(strategies[2], survival=0, name=f'Goblin {i}', team=1, hp=roll('2d6'), ac=15, actions=[
             Dodge(),
-            Awaken(),
+            #Awaken(),
             MeleeAttack('scimitar', +4, '1d6+2', 'slashing')
         ],
         ability_mods=[-1,2,0,0,-1,1])
     wins = 0
     for encounter_id in range(n):
-        env = Environment([fighter_lvl2(1), wizard_lvl2(1), goblin(1), goblin(2), goblin(3)])
+        env = [fighter_lvl2(1), wizard_lvl2(1), fighter_lvl2(2), wizard_lvl2(2)]
+        for i in range(5): env.append(goblin(i+1))
+        env = Environment(env)
         if env.run(): wins += 1
     return [s.buf for s in strategies] + [wins]
 
@@ -517,7 +519,7 @@ def merge_ppo_data(ppo_buffers):
 def main():
     epochs = 100
     ncpu = 4 # using 8 doesn't seem to help on an M1
-    strategies = [PPOStrategy(4), PPOStrategy(7), PPOStrategy(3)]
+    strategies = [PPOStrategy(3), PPOStrategy(4), PPOStrategy(2)]
     with multiprocessing.Pool(ncpu, init_workers, (strategies,)) as pool:
         for epoch in range(epochs):
             t1 = time.time()
